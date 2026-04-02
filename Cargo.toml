@@ -1,0 +1,13 @@
+[package]
+name = "kotlin_js_transpiler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+oxc_allocator = "0.123.0"
+oxc_ast = "0.123.0"
+oxc_codegen = "0.123.0"
+oxc_parser = "0.123.0"
+oxc_span = "0.123.0"
+tree-sitter = "0.26.8"
+tree-sitter-kotlin-ng = "1.1.0"
