@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::collections::HashMap;
 use tree_sitter::Node;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Program;
@@ -185,7 +186,7 @@ impl KotlinTranspiler {
     }
 
     fn transpile_function(node: &Node, source: &str) -> String {
-        let mut result = String::from("function ");
+        let mut result = String::from("async function ");
         let mut found_name = false;
         let mut found_params = false;
         let mut found_returns = false;
@@ -282,16 +283,47 @@ impl KotlinTranspiler {
 
     fn transpile_class(node: &Node, source: &str) -> String {
         let mut result = String::from("class ");
+        let mut class_name = String::new();
+        let mut super_class: Option<String> = None;
 
-        if let Some(class_name) = Self::find_first_identifier_text(node, source) {
+        if let Some(found_name) = Self::find_first_identifier_text(node, source) {
+            class_name = found_name;
             result.push_str(&class_name);
+        }
+
+        let class_header = Self::get_node_text(node, source);
+        if let Some(colon_idx) = class_header.find(':') {
+            let header_tail = &class_header[colon_idx + 1..];
+            let header_tail = header_tail.split('{').next().unwrap_or(header_tail).trim();
+            let first_super = header_tail.split(',').next().unwrap_or("").trim();
+            if !first_super.is_empty() {
+                let super_name = first_super
+                    .split('(')
+                    .next()
+                    .unwrap_or(first_super)
+                    .trim();
+                let super_name = super_name
+                    .split('<')
+                    .next()
+                    .unwrap_or(super_name)
+                    .trim();
+                if !super_name.is_empty() {
+                    super_class = Some(super_name.to_string());
+                    result.push_str(" extends ");
+                    result.push_str(super_name);
+                }
+            }
         }
 
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
                 match child.kind() {
                     "class_body" => {
-                        result.push_str(&Self::transpile_class_body(&child, source));
+                        result.push_str(&Self::transpile_class_body(
+                            &child,
+                            source,
+                            super_class.as_deref(),
+                        ));
                     }
                     _ => {}
                 }
@@ -305,8 +337,9 @@ impl KotlinTranspiler {
         Self::transpile_binding_declaration(node, source)
     }
 
-    fn transpile_class_body(node: &Node, source: &str) -> String {
+    fn transpile_class_body(node: &Node, source: &str, super_class: Option<&str>) -> String {
         let mut result = String::from(" {\n");
+        let mut overload_groups: HashMap<String, Vec<(Vec<String>, String)>> = HashMap::new();
 
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
@@ -316,8 +349,13 @@ impl KotlinTranspiler {
 
                 match child.kind() {
                     "function_declaration" => {
-                        result.push_str("  ");
-                        result.push_str(&Self::transpile_class_method(&child, source));
+                        if let Some((name, params, body)) = Self::parse_class_method_parts(&child, source)
+                        {
+                            overload_groups
+                                .entry(name)
+                                .or_default()
+                                .push((params, body));
+                        }
                     }
                     "property_declaration" | "variable_declaration" => {
                         let field = Self::transpile_binding_declaration(&child, source);
@@ -339,8 +377,126 @@ impl KotlinTranspiler {
             }
         }
 
+        if super_class.is_some() {
+            result.push_str("  constructor(...args) {\n");
+            result.push_str("    super(...args);\n");
+            result.push_str("  }\n");
+        }
+
+        for (name, overloads) in overload_groups {
+            result.push_str("  ");
+            result.push_str(&Self::emit_class_method_with_overloads(&name, &overloads));
+        }
+
         result.push_str("}\n");
         result
+    }
+
+    fn parse_class_method_parts(node: &Node, source: &str) -> Option<(String, Vec<String>, String)> {
+        let mut method_name: Option<String> = None;
+        let mut params: Vec<String> = Vec::new();
+        let mut body = String::from(" {\n}\n");
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                match child.kind() {
+                    "identifier" if method_name.is_none() => {
+                        method_name = Some(Self::get_node_text(&child, source));
+                    }
+                    "function_value_parameters" => {
+                        params = Self::extract_parameter_names(&child, source);
+                    }
+                    "function_body" => {
+                        body = Self::transpile_function_body(&child, source);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        method_name.map(|name| (name, params, body))
+    }
+
+    fn extract_parameter_names(node: &Node, source: &str) -> Vec<String> {
+        let mut params = Vec::new();
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                if child.kind() == "function_value_parameter" || child.kind() == "parameter" {
+                    if let Some(name) = Self::find_first_identifier_text(&child, source) {
+                        params.push(name);
+                    }
+                }
+            }
+        }
+
+        params
+    }
+
+    fn emit_class_method_with_overloads(name: &str, overloads: &[(Vec<String>, String)]) -> String {
+        if overloads.is_empty() {
+            return format!("async {}() {{\n}}\n", name);
+        }
+
+        if overloads.len() == 1 {
+            let (params, body) = &overloads[0];
+            let mut out = String::new();
+            out.push_str("async ");
+            out.push_str(name);
+            out.push('(');
+            out.push_str(&params.join(", "));
+            out.push(')');
+            out.push_str(body);
+            out.push('\n');
+            return out;
+        }
+
+        let mut out = String::new();
+    out.push_str("async ");
+    out.push_str(name);
+        out.push_str("(...args) {\n");
+
+        for (idx, (params, body)) in overloads.iter().enumerate() {
+            if idx == 0 {
+                out.push_str("    if ");
+            } else {
+                out.push_str("    else if ");
+            }
+            out.push_str(&format!("(args.length === {})", params.len()));
+            out.push_str(" {\n");
+
+            if !params.is_empty() {
+                out.push_str("      const [");
+                out.push_str(&params.join(", "));
+                out.push_str("] = args;\n");
+            }
+
+            let body_inner = body
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .trim();
+            for line in body_inner.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                out.push_str("      ");
+                out.push_str(trimmed);
+                out.push('\n');
+            }
+
+            out.push_str("    }\n");
+        }
+
+        out.push_str("    else {\n");
+        out.push_str(&format!(
+            "      throw new Error(\"No matching overload for {}\");\n",
+            name
+        ));
+        out.push_str("    }\n");
+        out.push_str("  }\n\n");
+        out
     }
 
     fn transpile_class_method(node: &Node, source: &str) -> String {
@@ -365,6 +521,10 @@ impl KotlinTranspiler {
                     _ => {}
                 }
             }
+        }
+
+        if !result.trim().is_empty() {
+            result = format!("async {}", result);
         }
 
         format!("{}\n", result)
@@ -596,7 +756,6 @@ impl KotlinTranspiler {
 
     fn transpile_apply_block_body(body: &str, receiver_var: &str) -> String {
         let mut result = String::new();
-        let mut skip_kotlin_lambda_depth: i32 = 0;
 
         for line in body.lines() {
             let trimmed = line.trim();
@@ -608,24 +767,10 @@ impl KotlinTranspiler {
                 continue;
             }
 
-            if skip_kotlin_lambda_depth > 0 {
-                skip_kotlin_lambda_depth += trimmed.matches('{').count() as i32;
-                skip_kotlin_lambda_depth -= trimmed.matches('}').count() as i32;
-                continue;
-            }
-
             let indent = line
                 .chars()
                 .take_while(|ch| ch.is_whitespace())
                 .collect::<String>();
-
-            if trimmed.contains(".forEach {") || trimmed.contains(".map {") || trimmed.contains(".mapIndexed {") {
-                result.push_str("  ");
-                result.push_str(&indent);
-                result.push_str("/* Kotlin lambda block omitted in JS transpile */\n");
-                skip_kotlin_lambda_depth = 1;
-                continue;
-            }
 
             if trimmed.contains("<") && trimmed.contains(">") && trimmed.contains("filterIsInstance") {
                 result.push_str("  ");
@@ -1531,7 +1676,171 @@ impl KotlinTranspiler {
         let text = text.replace("return throw ", "throw ");
         let text = Self::rewrite_kotlin_collection_calls(&text);
         let text = Self::rewrite_kotlin_trailing_lambdas(&text);
-        Self::rewrite_runtime_kotlinisms(&text)
+        let text = Self::rewrite_runtime_kotlinisms(&text);
+        let text = Self::rewrite_extension_calls(&text);
+        let text = Self::inject_extension_helpers(&text);
+        let text = Self::rewrite_kotlin_string_helpers(&text);
+        let text = Self::rewrite_collection_helpers(&text);
+        let text = Self::rewrite_instance_scoping(&text);
+        let text = Self::rewrite_async_bridge(&text);
+        let text = Self::rewrite_kotlin_null_safety(&text);
+        Self::rewrite_exports_metadata(&text)
+    }
+
+    fn rewrite_collection_helpers(text: &str) -> String {
+        let filter_is_instance = Regex::new(
+            r"\.filterIsInstance<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>\(\)",
+        )
+        .expect("valid filterIsInstance regex");
+        let out = filter_is_instance
+            .replace_all(text, ".filter((x) => x instanceof $1)")
+            .to_string();
+
+        let dangling_generic = Regex::new(r"\.([A-Za-z_][A-Za-z0-9_]*)>\(\)")
+            .expect("valid dangling generic regex");
+        let out = dangling_generic.replace_all(&out, "").to_string();
+
+        let bare_map = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_\.]*)\.map\s*;")
+            .expect("valid bare map regex");
+        bare_map
+            .replace_all(&out, "$1.map((it) => it);")
+            .to_string()
+    }
+
+    fn rewrite_instance_scoping(text: &str) -> String {
+        let out = text.replace("${baseUrl}", "${this.baseUrl}");
+
+        let preferences = Regex::new(r"\bpreferences\.")
+            .expect("valid preferences scope regex");
+        let out = preferences.replace_all(&out, "this.preferences.").to_string();
+
+        let get_headers = Regex::new(r"\bGET\(([^,]+),\s*headers\)")
+            .expect("valid GET headers regex");
+        let out = get_headers
+            .replace_all(&out, "GET($1, this.headers)")
+            .to_string();
+
+        let static_fields = Regex::new(
+            r"=\s*(PREF_[A-Z0-9_]+|NSFW_[A-Z0-9_]+|DEDUPLICATE_CHAPTERS|ALTERNATIVE_NAMES_IN_DESCRIPTION)\b",
+        )
+        .expect("valid static field regex");
+        static_fields
+            .replace_all(&out, "= this.constructor.$1")
+            .to_string()
+    }
+
+    fn rewrite_async_bridge(text: &str) -> String {
+        let mut out = text.to_string();
+
+        let exec_parse = Regex::new(r"=\s*([^;]*?)\.execute\(\)\.parseAs\(\)\s*;")
+            .expect("valid execute parse regex");
+        out = exec_parse
+            .replace_all(&out, "= parseAs(await $1.execute());")
+            .to_string();
+
+        let return_get = Regex::new(r"\breturn\s+GET\(")
+            .expect("valid return GET regex");
+        out = return_get.replace_all(&out, "return await GET(").to_string();
+
+        let assign_get = Regex::new(r"=\s*GET\(")
+            .expect("valid assign GET regex");
+        out = assign_get.replace_all(&out, "= await GET(").to_string();
+
+        let call_execute = Regex::new(r"=\s*([^;]*?\.execute\(\))\s*;")
+            .expect("valid execute await regex");
+        out = call_execute.replace_all(&out, "= await $1;").to_string();
+
+        out
+    }
+
+    fn rewrite_exports_metadata(text: &str) -> String {
+        let class_re = Regex::new(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)")
+            .expect("valid class capture regex");
+
+        let mut out = text.to_string();
+        if let Some(caps) = class_re.captures(text) {
+            if !text.contains("export default class") {
+                if let Some(m) = caps.get(0) {
+                    out = out.replacen(m.as_str(), &format!("export default {}", m.as_str()), 1);
+                }
+            }
+
+            if let Some(name_match) = caps.get(1) {
+                let class_name = name_match.as_str();
+                if !out.contains("export const __transpilerMeta") {
+                    out.push_str("\n");
+                    out.push_str("export const __transpilerMeta = {\n");
+                    out.push_str(&format!("  className: \"{}\",\n", class_name));
+                    out.push_str("  moduleFormat: \"esm\",\n");
+                    out.push_str("};\n");
+                }
+            }
+        }
+
+        out
+    }
+
+    fn rewrite_extension_calls(text: &str) -> String {
+        let to_http_url = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_\.]*)\.toHttpUrl\(\)")
+            .expect("valid toHttpUrl extension regex");
+        let out = to_http_url
+            .replace_all(text, "toHttpUrl_ext($1)")
+            .to_string();
+
+        let parse_as = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_\.]*)\.parseAs\(\)")
+            .expect("valid parseAs extension regex");
+        parse_as.replace_all(&out, "parseAs_ext($1)").to_string()
+    }
+
+    fn inject_extension_helpers(text: &str) -> String {
+        let mut helpers = String::new();
+
+        if text.contains("toHttpUrl_ext(") && !text.contains("function toHttpUrl_ext(") {
+            helpers.push_str("function toHttpUrl_ext(receiver) { return toHttpUrl(receiver); }\n");
+        }
+
+        if text.contains("parseAs_ext(") && !text.contains("function parseAs_ext(") {
+            helpers.push_str("function parseAs_ext(receiver) { return parseAs(receiver); }\n");
+        }
+
+        if helpers.is_empty() {
+            return text.to_string();
+        }
+
+        format!("{}{}", helpers, text)
+    }
+
+    fn rewrite_kotlin_string_helpers(text: &str) -> String {
+        let is_not_blank = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_\.]*)\.isNotBlank\(\)")
+            .expect("valid isNotBlank regex");
+        let out = is_not_blank
+            .replace_all(text, "($1 && $1.trim().length > 0)")
+            .to_string();
+
+        let remove_prefix = Regex::new(r#"\b([A-Za-z_][A-Za-z0-9_\.]*)\.removePrefix\(\"/\"\)"#)
+            .expect("valid removePrefix regex");
+        let out = remove_prefix
+            .replace_all(&out, "(($1).startsWith(\"/\") ? ($1).slice(1) : ($1))")
+            .to_string();
+
+        let substring_after_last = Regex::new(
+            r#"\b([A-Za-z_][A-Za-z0-9_\.]*)\.substringAfterLast\(\"/\"\)"#,
+        )
+        .expect("valid substringAfterLast regex");
+        substring_after_last
+            .replace_all(&out, "(($1).slice(($1).lastIndexOf(\"/\") + 1))")
+            .to_string()
+    }
+
+    fn rewrite_kotlin_null_safety(text: &str) -> String {
+        let elvis_throw = Regex::new(
+            r"\b([A-Za-z_][A-Za-z0-9_\.]*)\s*\?\?\s*\(\(\)\s*=>\s*\{\s*throw\s+([^;]+);\s*\}\)\(\)",
+        )
+        .expect("valid elvis throw regex");
+
+        elvis_throw
+            .replace_all(text, "(() => { const __v = $1; if (__v == null) { throw $2; } return __v; })()")
+            .to_string()
     }
 
     fn flatten_apply_iife_statement(text: &str) -> Option<String> {
