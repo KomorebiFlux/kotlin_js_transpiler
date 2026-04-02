@@ -163,6 +163,7 @@ dependencies = [
  "oxc_codegen",
  "oxc_parser",
  "oxc_span",
+ "regex",
  "tree-sitter",
  "tree-sitter-kotlin-ng",
 ]

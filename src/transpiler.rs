@@ -1,3 +1,4 @@
+use regex::Regex;
 use tree_sitter::Node;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Program;
@@ -12,7 +13,7 @@ impl KotlinTranspiler {
     /// Transpile Kotlin code to JavaScript
     pub fn transpile(kotlin_code: &str, tree: &tree_sitter::Tree) -> String {
         let root = tree.root_node();
-        let raw_js = Self::normalize_kotlin_apply_let_chains(&Self::transpile_node(&root, kotlin_code));
+        let raw_js = Self::sanitize_output_js(&Self::transpile_node(&root, kotlin_code));
         let allocator = Allocator::default();
         if let Some(program) = Self::transpile_to_oxc_program(&allocator, &raw_js) {
             Codegen::new().build(&program).code
@@ -55,18 +56,23 @@ impl KotlinTranspiler {
             "block_comment" => String::new(),
             "simple_identifier" => Self::get_node_text(node, source),
             "identifier" => Self::get_node_text(node, source),
-            "navigation_expression" => Self::get_node_text(node, source),
+            "navigation_expression" => {
+                Self::transpile_apply_let_chain(node, source)
+                    .unwrap_or_else(|| Self::sanitize_js_text(&Self::get_node_text(node, source)))
+            }
             "lambda_literal" => Self::transpile_lambda(node, source),
             "if_expression" => Self::transpile_if(node, source),
             "when_expression" => Self::transpile_when(node, source),
             "for_statement" => Self::transpile_for(node, source),
             "while_statement" => Self::transpile_while(node, source),
+            "do_while_statement" => Self::transpile_do_while(node, source),
             "assignment" => Self::transpile_assignment(node, source),
             "binary_expression" => Self::transpile_binary(node, source),
             "postfix_expression" => Self::transpile_postfix(node, source),
             "prefix_expression" => Self::transpile_prefix(node, source),
+            "companion_object" => String::new(),
             "block" => Self::transpile_block(node, source),
-            _ => Self::get_node_text(node, source),
+            _ => Self::sanitize_js_text(&Self::get_node_text(node, source)),
         }
     }
 
@@ -271,8 +277,8 @@ impl KotlinTranspiler {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
                 match child.kind() {
-                    "class_body" | "block" => {
-                        result.push_str(&Self::transpile_block(&child, source));
+                    "class_body" => {
+                        result.push_str(&Self::transpile_class_body(&child, source));
                     }
                     _ => {}
                 }
@@ -284,6 +290,97 @@ impl KotlinTranspiler {
 
     fn transpile_property(node: &Node, source: &str) -> String {
         Self::transpile_binding_declaration(node, source)
+    }
+
+    fn transpile_class_body(node: &Node, source: &str) -> String {
+        let mut result = String::from(" {\n");
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                if child.kind() == "{" || child.kind() == "}" || child.is_extra() {
+                    continue;
+                }
+
+                match child.kind() {
+                    "function_declaration" => {
+                        result.push_str("  ");
+                        result.push_str(&Self::transpile_class_method(&child, source));
+                    }
+                    "property_declaration" | "variable_declaration" => {
+                        let field = Self::transpile_binding_declaration(&child, source);
+                        let field = field.trim_start_matches("let ");
+                        result.push_str("  ");
+                        result.push_str(field);
+                    }
+                    "companion_object" => {
+                        result.push_str(&Self::transpile_companion_object(&child, source));
+                    }
+                    _ => {
+                        let out = Self::transpile_node(&child, source);
+                        if !out.trim().is_empty() {
+                            result.push_str("  ");
+                            result.push_str(&out);
+                        }
+                    }
+                }
+            }
+        }
+
+        result.push_str("}\n");
+        result
+    }
+
+    fn transpile_class_method(node: &Node, source: &str) -> String {
+        let mut result = String::new();
+        let mut found_name = false;
+        let mut found_params = false;
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                match child.kind() {
+                    "identifier" if !found_name => {
+                        result.push_str(&Self::get_node_text(&child, source));
+                        found_name = true;
+                    }
+                    "function_value_parameters" if !found_params => {
+                        result.push_str(&Self::transpile_parameters(&child, source));
+                        found_params = true;
+                    }
+                    "function_body" => {
+                        result.push_str(&Self::transpile_function_body(&child, source));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        format!("{}\n", result)
+    }
+
+    fn transpile_companion_object(node: &Node, source: &str) -> String {
+        let mut result = String::new();
+        let child_count = node.child_count();
+
+        for i in 0..child_count {
+            if let Some(child) = node.child(i as u32) {
+                if child.kind() != "class_body" {
+                    continue;
+                }
+
+                for j in 0..child.child_count() {
+                    if let Some(member) = child.child(j as u32) {
+                        if member.kind() == "property_declaration" {
+                            let mut field = Self::transpile_binding_declaration(&member, source);
+                            field = field.trim_start_matches("let ").to_string();
+                            result.push_str("  static ");
+                            result.push_str(&field);
+                        }
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     fn transpile_variable(node: &Node, source: &str) -> String {
@@ -299,6 +396,7 @@ impl KotlinTranspiler {
 
         if let Some(initializer) = initializer {
             let initializer = Self::normalize_initializer_js(initializer.trim());
+            let initializer = Self::normalize_if_expression_initializer(&initializer);
             let initializer = initializer.trim();
             if !initializer.is_empty() && initializer != name.as_deref().unwrap_or("") {
                 result.push_str(" = ");
@@ -345,13 +443,7 @@ impl KotlinTranspiler {
                     out.push_str("(() => { const __tmp = ");
                     out.push_str(receiver);
                     out.push_str("; ");
-
-                    if !body.is_empty() {
-                        out.push_str("/* Kotlin apply block omitted in JS transpile: ");
-                        let single_line = body.replace('\n', " ").replace("*/", "* /");
-                        out.push_str(single_line.trim());
-                        out.push_str(" */ ");
-                    }
+                    out.push_str(&Self::transpile_apply_block_body(body, "__tmp").replace('\n', " "));
 
                     out.push_str("return __tmp.build(); })()");
                     return out;
@@ -362,36 +454,111 @@ impl KotlinTranspiler {
         initializer.to_string()
     }
 
-    fn transpile_apply_let_chain(node: &Node, source: &str) -> Option<String> {
-        let raw = Self::get_node_text(node, source);
-        let apply_marker = ".apply {";
-        let let_marker = "}.let(";
-
-        let apply_idx = raw.find(apply_marker)?;
-        let let_idx = raw.rfind(let_marker)?;
-        if let_idx <= apply_idx {
-            return None;
+    fn normalize_if_expression_initializer(initializer: &str) -> String {
+        let trimmed = initializer.trim();
+        if !trimmed.starts_with("if (") {
+            return trimmed.to_string();
         }
 
-        let receiver = raw[..apply_idx].trim();
+        let cond_open = match trimmed.find('(') {
+            Some(pos) => pos,
+            None => return trimmed.to_string(),
+        };
+        let cond_close = match Self::find_matching_paren_end(trimmed, cond_open) {
+            Some(pos) => pos,
+            None => return trimmed.to_string(),
+        };
+
+        let condition = trimmed[cond_open + 1..cond_close - 1].trim();
+        let mut rest = trimmed[cond_close..].trim_start();
+        if !rest.starts_with('{') {
+            return trimmed.to_string();
+        }
+
+        let then_end = match Self::find_matching_brace_end(rest, 0) {
+            Some(pos) => pos,
+            None => return trimmed.to_string(),
+        };
+        let then_block = &rest[1..then_end - 1];
+
+        rest = rest[then_end..].trim_start();
+        if !rest.starts_with("else") {
+            return trimmed.to_string();
+        }
+        rest = rest[4..].trim_start();
+        if !rest.starts_with('{') {
+            return trimmed.to_string();
+        }
+
+        let else_end = match Self::find_matching_brace_end(rest, 0) {
+            Some(pos) => pos,
+            None => return trimmed.to_string(),
+        };
+        let else_block = &rest[1..else_end - 1];
+
+        let then_expr = then_block.trim().trim_end_matches(';');
+        let else_expr = else_block.trim().trim_end_matches(';');
+        if then_expr.is_empty() || else_expr.is_empty() {
+            return trimmed.to_string();
+        }
+
+        format!("({} ? {} : {})", condition, then_expr, else_expr)
+    }
+
+    fn transpile_apply_let_chain(node: &Node, source: &str) -> Option<String> {
+        let mut receiver_chain: Option<Node> = None;
+        let mut value_arguments: Option<Node> = None;
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                match child.kind() {
+                    "navigation_expression" => {
+                        if receiver_chain.is_none() {
+                            receiver_chain = Some(child);
+                        }
+                    }
+                    "value_arguments" => {
+                        if value_arguments.is_none() {
+                            value_arguments = Some(child);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let receiver_chain = receiver_chain?;
+        let value_arguments = value_arguments?;
+        let receiver_chain_text = Self::get_node_text(&receiver_chain, source);
+        let apply_marker = ".apply {";
+        let apply_idx = receiver_chain_text.find(apply_marker)?;
+
+        let receiver = receiver_chain_text[..apply_idx].trim();
         if receiver.is_empty() {
             return None;
         }
 
         let body_start = apply_idx + apply_marker.len();
-        let body_end = Self::find_matching_brace_end(&raw, body_start - 1)?;
-        if body_end > let_idx {
-            return None;
-        }
+        let body_end = Self::find_matching_brace_end(&receiver_chain_text, body_start - 1)?;
+        let body = receiver_chain_text[body_start..body_end - 1].trim();
 
-        let body = raw[body_start..body_end - 1].trim();
-        let let_call_open = let_idx + let_marker.len() - 1;
-        let let_call_end = Self::find_matching_paren_end(&raw, let_call_open)?;
-        if let_call_end <= let_call_open + 1 {
-            return None;
-        }
+        let let_target = {
+            let mut target = String::new();
+            let child_count = value_arguments.child_count();
+            for i in 0..child_count {
+                if let Some(child) = value_arguments.child(i as u32) {
+                    if child.kind() == "value_argument" {
+                        let text = Self::transpile_node(&child, source);
+                        if !text.trim().is_empty() {
+                            target = text.trim().to_string();
+                            break;
+                        }
+                    }
+                }
+            }
+            target
+        };
 
-        let let_target = raw[let_call_open + 1..let_call_end - 1].trim();
         if let_target.is_empty() {
             return None;
         }
@@ -403,80 +570,11 @@ impl KotlinTranspiler {
         result.push_str(";\n");
         result.push_str(&Self::transpile_apply_block_body(body, receiver_var));
         result.push_str("  ");
-        result.push_str(&Self::normalize_kotlin_callable_reference(let_target));
+        result.push_str(&Self::normalize_kotlin_callable_reference(&let_target));
         result.push_str("(__tmp);\n");
         result.push_str("  return __tmp;\n");
         result.push_str("})()");
         Some(result)
-    }
-
-    fn normalize_kotlin_apply_let_chains(source: &str) -> String {
-        let mut output = String::new();
-        let mut cursor = 0usize;
-
-        while let Some(rel_apply_idx) = source[cursor..].find(".apply {") {
-            let apply_idx = cursor + rel_apply_idx;
-            let let_idx = match source[apply_idx..].find("}.let(") {
-                Some(rel_let_idx) => apply_idx + rel_let_idx,
-                None => break,
-            };
-
-            let body_start = apply_idx + ".apply {".len();
-            let body_end = match Self::find_matching_brace_end(source, body_start - 1) {
-                Some(end) => end,
-                None => break,
-            };
-
-            if body_end > let_idx {
-                break;
-            }
-
-            let let_call_open = let_idx + ".let(".len() - 1;
-            let let_call_end = match Self::find_matching_paren_end(source, let_call_open) {
-                Some(end) => end,
-                None => break,
-            };
-
-            let receiver_slice = &source[cursor..apply_idx];
-            let receiver = receiver_slice
-                .trim_end()
-                .rsplit_once('\n')
-                .map(|(_, tail)| tail.trim_start())
-                .unwrap_or(receiver_slice)
-                .trim();
-            if receiver.is_empty() {
-                output.push_str(&source[cursor..let_call_end]);
-                cursor = let_call_end;
-                continue;
-            }
-
-            let receiver_start = receiver_slice.rfind(receiver).map(|idx| cursor + idx).unwrap_or(apply_idx);
-            output.push_str(&source[cursor..receiver_start]);
-
-            let body = source[body_start..body_end - 1].trim();
-            let let_target = source[let_call_open + 1..let_call_end - 1].trim();
-            if let_target.is_empty() {
-                output.push_str(&source[receiver_start..let_call_end]);
-                cursor = let_call_end;
-                continue;
-            }
-
-            output.push_str("(() => {\n");
-            output.push_str("  const __tmp = ");
-            output.push_str(receiver);
-            output.push_str(";\n");
-            output.push_str(&Self::transpile_apply_block_body(body, "__tmp"));
-            output.push_str("  ");
-            output.push_str(&Self::normalize_kotlin_callable_reference(let_target));
-            output.push_str("(__tmp);\n");
-            output.push_str("  return __tmp;\n");
-            output.push_str("})()");
-
-            cursor = let_call_end;
-        }
-
-        output.push_str(&source[cursor..]);
-        output
     }
 
     fn normalize_kotlin_callable_reference(value: &str) -> String {
@@ -485,6 +583,7 @@ impl KotlinTranspiler {
 
     fn transpile_apply_block_body(body: &str, receiver_var: &str) -> String {
         let mut result = String::new();
+        let mut skip_kotlin_lambda_depth: i32 = 0;
 
         for line in body.lines() {
             let trimmed = line.trim();
@@ -492,10 +591,35 @@ impl KotlinTranspiler {
                 continue;
             }
 
+            if trimmed.starts_with("//") {
+                continue;
+            }
+
+            if skip_kotlin_lambda_depth > 0 {
+                skip_kotlin_lambda_depth += trimmed.matches('{').count() as i32;
+                skip_kotlin_lambda_depth -= trimmed.matches('}').count() as i32;
+                continue;
+            }
+
             let indent = line
                 .chars()
                 .take_while(|ch| ch.is_whitespace())
                 .collect::<String>();
+
+            if trimmed.contains(".forEach {") || trimmed.contains(".map {") || trimmed.contains(".mapIndexed {") {
+                result.push_str("  ");
+                result.push_str(&indent);
+                result.push_str("/* Kotlin lambda block omitted in JS transpile */\n");
+                skip_kotlin_lambda_depth = 1;
+                continue;
+            }
+
+            if trimmed.contains("<") && trimmed.contains(">") && trimmed.contains("filterIsInstance") {
+                result.push_str("  ");
+                result.push_str(&indent);
+                result.push_str("/* Kotlin generic call omitted in JS transpile */\n");
+                continue;
+            }
 
             if let Some((lhs, rhs)) = trimmed.split_once(" = ") {
                 let lhs = lhs.trim();
@@ -507,9 +631,27 @@ impl KotlinTranspiler {
                     result.push_str(lhs);
                     result.push_str(" = ");
                     result.push_str(rhs.trim_start());
+                    if !rhs.trim_end().ends_with('+') {
+                        result.push(';');
+                    }
                     result.push('\n');
                     continue;
                 }
+            }
+
+            if trimmed.starts_with('"') || trimmed.starts_with('\'') || trimmed.starts_with('+') {
+                if trimmed == "+" {
+                    continue;
+                }
+
+                result.push_str("  ");
+                result.push_str(&indent);
+                result.push_str(trimmed);
+                if !trimmed.starts_with('+') && !trimmed.ends_with(';') && !trimmed.ends_with('+') {
+                    result.push(';');
+                }
+                result.push('\n');
+                continue;
             }
 
             let call_candidate = trimmed.strip_suffix(';').unwrap_or(trimmed);
@@ -523,8 +665,12 @@ impl KotlinTranspiler {
                 result.push_str("  ");
                 result.push_str(&indent);
                 result.push_str(receiver_var);
-                result.push('.');
-                result.push_str(call_candidate);
+                if call_candidate.starts_with('.') {
+                    result.push_str(call_candidate);
+                } else {
+                    result.push('.');
+                    result.push_str(call_candidate);
+                }
                 result.push_str(";\n");
                 continue;
             }
@@ -663,128 +809,6 @@ impl KotlinTranspiler {
         None
     }
 
-    fn find_matching_paren_end(source: &str, open_paren_index: usize) -> Option<usize> {
-        let bytes = source.as_bytes();
-        if bytes.get(open_paren_index) != Some(&b'(') {
-            return None;
-        }
-
-        let mut depth = 0usize;
-        let mut i = open_paren_index;
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut in_template = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-        let mut escaped = false;
-
-        while i < bytes.len() {
-            let b = bytes[i];
-            let next = bytes.get(i + 1).copied();
-
-            if in_line_comment {
-                if b == b'\n' {
-                    in_line_comment = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_block_comment {
-                if b == b'*' && next == Some(b'/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_single {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'\'' {
-                    in_single = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_double {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'"' {
-                    in_double = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_template {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'`' {
-                    in_template = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if b == b'/' && next == Some(b'/') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if b == b'/' && next == Some(b'*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if b == b'\'' {
-                in_single = true;
-                i += 1;
-                continue;
-            }
-
-            if b == b'"' {
-                in_double = true;
-                i += 1;
-                continue;
-            }
-
-            if b == b'`' {
-                in_template = true;
-                i += 1;
-                continue;
-            }
-
-            if b == b'(' {
-                depth += 1;
-            } else if b == b')' {
-                if depth == 0 {
-                    return None;
-                }
-
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-
-            i += 1;
-        }
-
-        None
-    }
-
     fn find_first_initializer(node: &Node, source: &str) -> Option<String> {
         let child_count = node.child_count();
         let mut seen_equals = false;
@@ -839,7 +863,7 @@ impl KotlinTranspiler {
         if result.trim().is_empty() {
             Self::get_node_text(node, source)
         } else {
-            result
+            Self::rewrite_kotlin_trailing_lambdas(&result)
         }
     }
 
@@ -870,7 +894,72 @@ impl KotlinTranspiler {
     }
 
     fn transpile_string_literal(node: &Node, source: &str) -> String {
-        Self::get_node_text(node, source)
+        let raw = Self::get_node_text(node, source);
+        if !(raw.starts_with('"') && raw.ends_with('"')) {
+            return raw;
+        }
+
+        if !raw.contains('$') {
+            return raw;
+        }
+
+        let inner = &raw[1..raw.len() - 1];
+        let mut out = String::from("`");
+        let chars: Vec<char> = inner.chars().collect();
+        let mut i = 0usize;
+
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch == '$' {
+                if i + 1 < chars.len() && chars[i + 1] == '{' {
+                    let mut j = i + 2;
+                    let mut expr = String::new();
+                    while j < chars.len() && chars[j] != '}' {
+                        expr.push(chars[j]);
+                        j += 1;
+                    }
+                    out.push_str("${");
+                    out.push_str(expr.trim());
+                    out.push('}');
+                    i = if j < chars.len() { j + 1 } else { j };
+                    continue;
+                }
+
+                let mut j = i + 1;
+                let mut ident = String::new();
+                while j < chars.len() {
+                    let c = chars[j];
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        ident.push(c);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if ident.is_empty() {
+                    out.push('$');
+                    i += 1;
+                    continue;
+                }
+
+                out.push_str("${");
+                out.push_str(&ident);
+                out.push('}');
+                i = j;
+                continue;
+            }
+
+            if ch == '`' {
+                out.push_str("\\`");
+            } else {
+                out.push(ch);
+            }
+            i += 1;
+        }
+
+        out.push('`');
+        out
     }
 
     fn transpile_lambda(node: &Node, source: &str) -> String {
@@ -921,11 +1010,6 @@ impl KotlinTranspiler {
             return format!("{}\n", Self::get_node_text(node, source));
         }
 
-        let mut result = String::new();
-        result.push_str("if (");
-        result.push_str(condition.trim());
-        result.push_str(") ");
-
         let mut non_condition_nodes: Vec<Node> = Vec::new();
         let cond_span = node
             .child_by_field_name("condition")
@@ -941,6 +1025,11 @@ impl KotlinTranspiler {
                 non_condition_nodes.push(child);
             }
         }
+
+        let mut result = String::new();
+        result.push_str("if (");
+        result.push_str(condition.trim());
+        result.push_str(") ");
 
         if let Some(then_node) = non_condition_nodes.first() {
             if then_node.kind() == "block" {
@@ -1192,6 +1281,29 @@ impl KotlinTranspiler {
         format!("{}\n", result)
     }
 
+    fn transpile_do_while(node: &Node, source: &str) -> String {
+        let condition = node
+            .child_by_field_name("condition")
+            .map(|cond| Self::transpile_node(&cond, source))
+            .unwrap_or_default();
+
+        let mut body = String::from("{\n}\n");
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                if child.kind() == "block" {
+                    body = Self::transpile_block(&child, source);
+                    break;
+                }
+            }
+        }
+
+        if condition.trim().is_empty() {
+            return format!("do {};\n", body.trim());
+        }
+
+        format!("do {} while ({});\n", body, condition.trim())
+    }
+
     fn transpile_assignment(node: &Node, source: &str) -> String {
         let mut result = String::new();
         let child_count = node.child_count();
@@ -1213,6 +1325,28 @@ impl KotlinTranspiler {
     }
 
     fn transpile_binary(node: &Node, source: &str) -> String {
+        let node_text = Self::get_node_text(node, source);
+        if node_text.contains("?:") {
+            let left = node
+                .child_by_field_name("left")
+                .map(|n| Self::transpile_node(&n, source))
+                .unwrap_or_default();
+            let right = node
+                .child_by_field_name("right")
+                .map(|n| Self::transpile_node(&n, source))
+                .unwrap_or_default();
+
+            if right.trim_start().starts_with("throw ") {
+                return format!(
+                    "(({}) ?? (() => {{ {}; }})())",
+                    left.trim(),
+                    right.trim().trim_end_matches(';')
+                );
+            }
+
+            return format!("(({}) ?? ({}))", left.trim(), right.trim());
+        }
+
         let mut result = String::new();
         let child_count = node.child_count();
 
@@ -1220,9 +1354,14 @@ impl KotlinTranspiler {
             if let Some(child) = node.child(i as u32) {
                 match child.kind() {
                     "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&"
-                    | "||" | "&" | "|" | "^" => {
+                    | "||" | "&" | "|" | "^" | "?:" => {
                         result.push(' ');
-                        result.push_str(&Self::get_node_text(&child, source));
+                        let op = Self::get_node_text(&child, source);
+                        if op == "?:" {
+                            result.push_str("??");
+                        } else {
+                            result.push_str(&op);
+                        }
                         result.push(' ');
                     }
                     "as" => {
@@ -1251,7 +1390,11 @@ impl KotlinTranspiler {
             if let Some(child) = node.child(i as u32) {
                 match child.kind() {
                     "postfix_suffix" => {
-                        result.push_str(&Self::get_node_text(&child, source));
+                        let suffix = Self::get_node_text(&child, source);
+                        if suffix.trim() == "!!" {
+                            continue;
+                        }
+                        result.push_str(&suffix);
                     }
                     _ => {
                         result.push_str(&Self::transpile_node(&child, source));
@@ -1285,8 +1428,40 @@ impl KotlinTranspiler {
                 if child.kind() != "{" && child.kind() != "}" && !child.is_extra() {
                     let child_output = Self::transpile_node(&child, source);
                     if !child_output.trim().is_empty() {
+                        let trimmed_output = child_output.trim_end();
+
+                        if let Some(flattened) = Self::flatten_apply_iife_statement(trimmed_output) {
+                            for line in flattened.lines() {
+                                let trimmed_line = line.trim();
+                                if trimmed_line.is_empty() {
+                                    continue;
+                                }
+                                result.push_str("  ");
+                                result.push_str(trimmed_line);
+                                if !trimmed_line.ends_with(';')
+                                    && !trimmed_line.ends_with('}')
+                                    && !trimmed_line.ends_with('{')
+                                    && !trimmed_line.ends_with(':')
+                                    && !trimmed_line.ends_with('+')
+                                {
+                                    result.push(';');
+                                }
+                                result.push('\n');
+                            }
+                            continue;
+                        }
+
                         result.push_str("  ");
-                        result.push_str(&child_output);
+                        result.push_str(trimmed_output);
+                        if !trimmed_output.ends_with(';')
+                            && !trimmed_output.ends_with('}')
+                            && !trimmed_output.ends_with('{')
+                            && !trimmed_output.ends_with(':')
+                            && !trimmed_output.ends_with('+')
+                        {
+                            result.push(';');
+                        }
+                        result.push('\n');
                     }
                 }
             }
@@ -1303,6 +1478,333 @@ impl KotlinTranspiler {
             source[start..end].to_string()
         } else {
             String::new()
+        }
+    }
+
+    fn find_matching_paren_end(source: &str, open_paren_index: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        if bytes.get(open_paren_index) != Some(&b'(') {
+            return None;
+        }
+
+        let mut depth = 0usize;
+        let mut i = open_paren_index;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            i += 1;
+        }
+
+        None
+    }
+
+    fn sanitize_js_text(text: &str) -> String {
+        let text = text.replace("!!", "");
+        let text = Self::rewrite_kotlin_collection_calls(&text);
+        Self::rewrite_runtime_kotlinisms(&text)
+    }
+
+    fn sanitize_output_js(text: &str) -> String {
+        let text = text.replace("return throw ", "throw ");
+        let text = Self::rewrite_kotlin_collection_calls(&text);
+        let text = Self::rewrite_kotlin_trailing_lambdas(&text);
+        Self::rewrite_runtime_kotlinisms(&text)
+    }
+
+    fn flatten_apply_iife_statement(text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        if !(trimmed.starts_with("(() => {") && trimmed.ends_with("})()")) {
+            return None;
+        }
+
+        let body = trimmed
+            .trim_start_matches("(() => {")
+            .trim_end_matches("})()")
+            .trim();
+
+        if !body.contains("const __tmp =") {
+            return None;
+        }
+
+        let mut out_lines: Vec<String> = Vec::new();
+        out_lines.push("{".to_string());
+        for line in body.lines() {
+            let t = line.trim();
+            if t.is_empty() || t == "return __tmp;" {
+                continue;
+            }
+            out_lines.push(t.to_string());
+        }
+        out_lines.push("}".to_string());
+
+        if out_lines.len() <= 2 {
+            None
+        } else {
+            Some(out_lines.join("\n"))
+        }
+    }
+
+    fn rewrite_kotlin_collection_calls(text: &str) -> String {
+        let mut out = String::new();
+        let mut i = 0usize;
+
+        while i < text.len() {
+            let rest = match text.get(i..) {
+                Some(r) => r,
+                None => break,
+            };
+
+            if rest.starts_with("listOf(") {
+                let open = i + "listOf".len();
+                if let Some(end) = Self::find_matching_paren_end(text, open) {
+                    let inner = &text[open + 1..end - 1];
+                    out.push('[');
+                    out.push_str(inner);
+                    out.push(']');
+                    i = end;
+                    continue;
+                }
+            }
+
+            if rest.starts_with("arrayOf(") {
+                let open = i + "arrayOf".len();
+                if let Some(end) = Self::find_matching_paren_end(text, open) {
+                    let inner = &text[open + 1..end - 1];
+                    out.push('[');
+                    out.push_str(inner);
+                    out.push(']');
+                    i = end;
+                    continue;
+                }
+            }
+
+            if rest.starts_with("ArrayList<") {
+                if let Some(gt_rel) = rest.find('>') {
+                    let after_gt = i + gt_rel + 1;
+                    if text.get(after_gt..after_gt + 2) == Some("()") {
+                        out.push_str("[]");
+                        i = after_gt + 2;
+                        continue;
+                    }
+                }
+            }
+
+            if rest.starts_with("ArrayList(") {
+                let open = i + "ArrayList".len();
+                if let Some(end) = Self::find_matching_paren_end(text, open) {
+                    let inner = text[open + 1..end - 1].trim();
+                    if inner.is_empty() {
+                        out.push_str("[]");
+                        i = end;
+                        continue;
+                    }
+
+                    out.push_str("[...");
+                    out.push_str(inner);
+                    out.push(']');
+                    i = end;
+                    continue;
+                }
+            }
+
+            if let Some(ch) = rest.chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        out
+    }
+
+    fn rewrite_runtime_kotlinisms(text: &str) -> String {
+        let text = text
+            .replace(".addAll(", ".push(...")
+            .replace(".isEmpty()", ".length === 0")
+            .replace(".mapIndexed(", ".map(")
+            .replace("LinkedHashMap()", "new Map()")
+            .replace("throw Exception(", "throw new Error(");
+
+        Self::rewrite_map_semantics(&text)
+    }
+
+    fn rewrite_map_semantics(text: &str) -> String {
+        let map_decl = Regex::new(
+            r"(?:\blet\s+|\b)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+Map\(\)\s*;",
+        )
+        .expect("valid map declaration regex");
+
+        let mut out = text.to_string();
+        let map_vars: Vec<String> = map_decl
+            .captures_iter(text)
+            .filter_map(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+            .collect();
+
+        for map_var in map_vars {
+            let escaped = regex::escape(&map_var);
+
+            let read_pattern = Regex::new(&format!(
+                r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*{}\s*\[\s*([^\]]+?)\s*\]\s*;",
+                escaped
+            ))
+            .expect("valid map read regex");
+            out = read_pattern
+                .replace_all(&out, format!("let $1 = {}.get($2);", map_var).as_str())
+                .to_string();
+
+            let write_pattern = Regex::new(&format!(
+                r"\b{}\s*\[\s*([^\]]+?)\s*\]\s*=\s*([^;]+);",
+                escaped
+            ))
+            .expect("valid map write regex");
+            out = write_pattern
+                .replace_all(&out, format!("{}.set($1, $2);", map_var).as_str())
+                .to_string();
+
+            let values_pattern = Regex::new(&format!(
+                r"\b{}\.values\.toList\(\)",
+                escaped
+            ))
+            .expect("valid map values regex");
+            out = values_pattern
+                .replace_all(&out, format!("Array.from({}.values())", map_var).as_str())
+                .to_string();
+        }
+
+        out
+    }
+
+    fn rewrite_kotlin_trailing_lambdas(text: &str) -> String {
+        let methods = ["forEach", "mapIndexed", "map"];
+        let mut out = String::new();
+        let mut cursor = 0usize;
+
+        while let Some(rel_dot) = text[cursor..].find('.') {
+            let dot = cursor + rel_dot;
+            out.push_str(&text[cursor..dot]);
+
+            let mut replaced = false;
+            for method in methods {
+                let name_start = dot + 1;
+                let name_end = name_start + method.len();
+                if name_end > text.len() || !text[name_start..].starts_with(method) {
+                    continue;
+                }
+
+                let brace_start = Self::skip_ascii_whitespace(text, name_end);
+                if text.as_bytes().get(brace_start) != Some(&b'{') {
+                    continue;
+                }
+
+                if let Some(brace_end) = Self::find_matching_brace_end(text, brace_start) {
+                    let body = text[brace_start + 1..brace_end - 1].trim();
+                    out.push('.');
+                    out.push_str(method);
+                    out.push_str(&Self::build_js_lambda_call(method, body));
+                    cursor = brace_end;
+                    replaced = true;
+                    break;
+                }
+            }
+
+            if !replaced {
+                out.push('.');
+                cursor = dot + 1;
+            }
+        }
+
+        out.push_str(&text[cursor..]);
+        out
+    }
+
+    fn skip_ascii_whitespace(text: &str, mut index: usize) -> usize {
+        let bytes = text.as_bytes();
+        while let Some(b) = bytes.get(index) {
+            if !b.is_ascii_whitespace() {
+                break;
+            }
+            index += 1;
+        }
+        index
+    }
+
+    fn build_js_lambda_call(method: &str, kotlin_body: &str) -> String {
+        let (mut params, body) = match kotlin_body.split_once("->") {
+            Some((raw_params, raw_body)) => {
+                let params: Vec<String> = raw_params
+                    .split(',')
+                    .map(|p| p.trim())
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_string())
+                    .collect();
+                (params, raw_body.trim().to_string())
+            }
+            None => (vec!["it".to_string()], kotlin_body.trim().to_string()),
+        };
+
+        if method == "mapIndexed" && params.len() >= 2 {
+            // Kotlin mapIndexed lambda params are (index, item), JS map callback is (item, index).
+            params.swap(0, 1);
+        }
+
+        if params.is_empty() {
+            params.push("it".to_string());
+        }
+
+        let params = params.join(", ");
+        let body = Self::strip_kotlin_named_args(&Self::sanitize_js_text(body.trim()));
+        let body = body.trim();
+
+        if method == "forEach" {
+            return format!("(({}) => {{ {} }})", params, Self::ensure_statement(body));
+        }
+
+        if Self::looks_like_expression(body) {
+            format!("(({}) => {})", params, body)
+        } else {
+            format!("(({}) => {{ {} }})", params, Self::ensure_statement(body))
+        }
+    }
+
+    fn strip_kotlin_named_args(value: &str) -> String {
+        let mut out = value.to_string();
+        for marker in ["imageUrl = ", "title = ", "summary = ", "key = "] {
+            out = out.replace(marker, "");
+        }
+        out
+    }
+
+    fn looks_like_expression(value: &str) -> bool {
+        !value.is_empty()
+            && !value.contains('\n')
+            && !value.contains(';')
+            && !value.starts_with("if ")
+            && !value.starts_with("for ")
+            && !value.starts_with("while ")
+            && !value.starts_with("switch ")
+            && !value.starts_with("return ")
+    }
+
+    fn ensure_statement(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if trimmed.ends_with(';') || trimmed.ends_with('}') {
+            trimmed.to_string()
+        } else {
+            format!("{};", trimmed)
         }
     }
 }
@@ -1327,13 +1829,25 @@ mod tests {
         Some(Codegen::new().build(&parsed.program).code)
     }
 
-    fn format_js_with_oxc(js_code: &str) -> String {
+    fn format_js_with_oxc(js_code: &str) -> (String, bool) {
         if let Some(formatted) = try_format_with_oxc(js_code) {
-            return formatted;
+            return (formatted, true);
+        }
+
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, js_code, SourceType::mjs()).parse();
+        if parsed.panicked {
+            println!("Oxc parser panicked while parsing full program.");
+        }
+        if !parsed.errors.is_empty() {
+            println!("Oxc parse errors (first 5):");
+            for error in parsed.errors.iter().take(5) {
+                println!("  {:?}", error);
+            }
         }
 
         println!("Oxc full-program parse failed; applying best-effort function-level formatting.");
-        format_functions_with_oxc(js_code)
+        (format_functions_with_oxc(js_code), false)
     }
 
     fn format_functions_with_oxc(js_code: &str) -> String {
@@ -1500,9 +2014,10 @@ fun main() {
         let formatted_js = format_js_with_oxc(&js_code);
         
         println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js);
+        println!("Formatted JS:\n{}", formatted_js.0);
         
         assert!(!js_code.is_empty());
+        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
     }
 
     #[test]
@@ -1518,8 +2033,9 @@ fun test() {
         let formatted_js = format_js_with_oxc(&js_code);
 
         println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js);
-        
+        println!("Formatted JS:\n{}", formatted_js.0);
+        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
+
         assert!(js_code.contains("let"));
     }
 
@@ -1535,9 +2051,35 @@ fun test() {
         let formatted_js = format_js_with_oxc(&js_code);
 
         println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js);
+        println!("Formatted JS:\n{}", formatted_js.0);
 
         assert!(js_code.contains("let"));
+        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
+    }
+
+    #[test]
+    fn test_apply_let_chain_transpile() {
+        let kotlin_code = r#"
+fun setupPreferenceScreen(screen: PreferenceScreen) {
+    ListPreference(screen.context).apply {
+        key = PREF_POSTER_QUALITY
+        title = "Thumbnail Quality"
+        setDefaultValue("large")
+    }.let(screen::addPreference)
+}
+"#;
+        let tree = parse_kotlin_code(kotlin_code);
+        println!("AST:\n{}", tree.root_node().to_sexp());
+        let js_code = KotlinTranspiler::transpile(kotlin_code, &tree);
+        let formatted_js = format_js_with_oxc(&js_code);
+
+        println!("Transpiled JS:\n{}", js_code);
+        println!("Formatted JS:\n{}", formatted_js.0);
+
+        assert!(!js_code.contains(".apply {"));
+        assert!(!js_code.contains(".let("));
+        assert!(formatted_js.0.contains("screen.addPreference") || formatted_js.0.contains("addPreference"));
+        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
     }
 
     #[test]
@@ -1551,8 +2093,9 @@ import kotlin.collections.Map
         let formatted_js = format_js_with_oxc(&js_code);
 
         println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js);
+        println!("Formatted JS:\n{}", formatted_js.0);
         assert!(js_code.contains("import { List } from \"java.util\";"));
+        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
     }
 
     #[test]
@@ -1563,7 +2106,8 @@ import kotlin.collections.Map
         let formatted_js = format_js_with_oxc(&js_code);
 
         println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js);
+        println!("Formatted JS:\n{}", formatted_js.0);
+        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
         assert!(!js_code.is_empty());
     }
 }

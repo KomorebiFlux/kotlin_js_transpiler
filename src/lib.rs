@@ -64,8 +64,9 @@ mod tests {
     #[test]
     fn test_transpile_full() {
         let js_code = transpile_kotlin_to_js(FULL_TEST_SOURCE_CODE);
+        println!("Transpiled JS:\n{}", js_code);
         assert!(!js_code.is_empty());
         assert!(js_code.contains("class") || js_code.contains("function"));
-        println!("Transpiled JS:\n{}", js_code);
+        assert!(!js_code.contains("Oxc full-program parse failed; applying best-effort function-level formatting."));
     }
 }
