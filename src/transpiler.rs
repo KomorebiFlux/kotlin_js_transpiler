@@ -77,19 +77,32 @@ impl KotlinTranspiler {
     }
 
     fn transpile_value_argument(node: &Node, source: &str) -> String {
+        let mut seen_equals = false;
+        let mut first_non_empty: Option<String> = None;
         let child_count = node.child_count();
         for i in 0..child_count {
             if let Some(child) = node.child(i as u32) {
                 if child.is_extra() || child.kind() == "," {
                     continue;
                 }
+
+                if child.kind() == "=" {
+                    seen_equals = true;
+                    continue;
+                }
+
                 let out = Self::transpile_node(&child, source);
                 if !out.trim().is_empty() {
-                    return out;
+                    if seen_equals {
+                        return out;
+                    }
+                    if first_non_empty.is_none() {
+                        first_non_empty = Some(out);
+                    }
                 }
             }
         }
-        String::new()
+        first_non_empty.unwrap_or_default()
     }
 
     fn transpile_source_file(node: &Node, source: &str) -> String {
@@ -1778,11 +1791,79 @@ impl KotlinTranspiler {
     }
 
     fn strip_kotlin_named_args(value: &str) -> String {
-        let mut out = value.to_string();
-        for marker in ["imageUrl = ", "title = ", "summary = ", "key = "] {
-            out = out.replace(marker, "");
+        let bytes = value.as_bytes();
+        let mut out = String::with_capacity(value.len());
+        let mut i = 0usize;
+        let mut paren_depth = 0usize;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+
+            if b == b'(' {
+                paren_depth += 1;
+                out.push('(');
+                i += 1;
+                continue;
+            }
+
+            if b == b')' {
+                paren_depth = paren_depth.saturating_sub(1);
+                out.push(')');
+                i += 1;
+                continue;
+            }
+
+            if paren_depth > 0
+                && (b.is_ascii_alphabetic() || b == b'_')
+                && Self::is_named_arg_boundary(bytes, i)
+            {
+                let mut ident_end = i + 1;
+                while ident_end < bytes.len()
+                    && (bytes[ident_end].is_ascii_alphanumeric() || bytes[ident_end] == b'_')
+                {
+                    ident_end += 1;
+                }
+
+                let mut eq_pos = ident_end;
+                while eq_pos < bytes.len() && bytes[eq_pos].is_ascii_whitespace() {
+                    eq_pos += 1;
+                }
+
+                if eq_pos < bytes.len()
+                    && bytes[eq_pos] == b'='
+                    && bytes.get(eq_pos + 1) != Some(&b'=')
+                    && bytes.get(eq_pos + 1) != Some(&b'>')
+                {
+                    i = eq_pos + 1;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+
+            out.push(b as char);
+            i += 1;
         }
+
         out
+    }
+
+    fn is_named_arg_boundary(bytes: &[u8], index: usize) -> bool {
+        if index == 0 {
+            return false;
+        }
+
+        let mut i = index;
+        while i > 0 {
+            i -= 1;
+            if bytes[i].is_ascii_whitespace() {
+                continue;
+            }
+            return bytes[i] == b'(' || bytes[i] == b',';
+        }
+
+        false
     }
 
     fn looks_like_expression(value: &str) -> bool {
