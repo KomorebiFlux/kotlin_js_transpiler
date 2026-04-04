@@ -3,6 +3,13 @@ name = "kotlin_js_transpiler"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+
+
 [dependencies]
 oxc_allocator = "0.123.0"
 oxc_ast = "0.123.0"

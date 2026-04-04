@@ -72,6 +72,7 @@ impl KotlinTranspiler {
             "postfix_expression" => Self::transpile_postfix(node, source),
             "prefix_expression" => Self::transpile_prefix(node, source),
             "companion_object" => String::new(),
+            "object_declaration" => Self::transpile_object(node, source),
             "block" => Self::transpile_block(node, source),
             _ => Self::sanitize_js_text(&Self::get_node_text(node, source)),
         }
@@ -283,15 +284,20 @@ impl KotlinTranspiler {
 
     fn transpile_class(node: &Node, source: &str) -> String {
         let mut result = String::from("class ");
-        let mut class_name = String::new();
         let mut super_class: Option<String> = None;
 
-        if let Some(found_name) = Self::find_first_identifier_text(node, source) {
-            class_name = found_name;
+        let class_text = Self::get_node_text(node, source);
+        let class_header = class_text.split('{').next().unwrap_or(&class_text).trim();
+
+        if let Some(class_name) = Regex::new(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)")
+            .expect("valid class name regex")
+            .captures(class_header)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+        {
             result.push_str(&class_name);
         }
 
-        let class_header = Self::get_node_text(node, source);
         if let Some(colon_idx) = class_header.find(':') {
             let header_tail = &class_header[colon_idx + 1..];
             let header_tail = header_tail.split('{').next().unwrap_or(header_tail).trim();
@@ -333,6 +339,37 @@ impl KotlinTranspiler {
         format!("{}\n", result)
     }
 
+    fn transpile_object(node: &Node, source: &str) -> String {
+        let mut result = String::from("class ");
+        let mut object_body: Option<Node> = None;
+
+        if let Some(object_name) = Regex::new(r"\bobject\s+([A-Za-z_][A-Za-z0-9_]*)")
+            .expect("valid object name regex")
+            .captures(&Self::get_node_text(node, source))
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+        {
+            result.push_str(&object_name);
+        }
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                if child.kind() == "class_body" {
+                    object_body = Some(child);
+                    break;
+                }
+            }
+        }
+
+        if let Some(body) = object_body {
+            result.push_str(&Self::transpile_object_body(&body, source));
+        } else {
+            result.push_str(" {\n}\n");
+        }
+
+        format!("{}\n", result)
+    }
+
     fn transpile_property(node: &Node, source: &str) -> String {
         Self::transpile_binding_declaration(node, source)
     }
@@ -363,9 +400,7 @@ impl KotlinTranspiler {
                         result.push_str("  ");
                         result.push_str(field);
                     }
-                    "companion_object" => {
-                        result.push_str(&Self::transpile_companion_object(&child, source));
-                    }
+                    "companion_object" | "class_declaration" | "object_declaration" => {}
                     _ => {
                         let out = Self::transpile_node(&child, source);
                         if !out.trim().is_empty() {
@@ -385,6 +420,52 @@ impl KotlinTranspiler {
 
         for (name, overloads) in overload_groups {
             result.push_str("  ");
+            result.push_str(&Self::emit_class_method_with_overloads(&name, &overloads));
+        }
+
+        result.push_str("}\n");
+        result
+    }
+
+    fn transpile_object_body(node: &Node, source: &str) -> String {
+        let mut result = String::from(" {\n");
+        let mut overload_groups: HashMap<String, Vec<(Vec<String>, String)>> = HashMap::new();
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                if child.kind() == "{" || child.kind() == "}" || child.is_extra() {
+                    continue;
+                }
+
+                match child.kind() {
+                    "function_declaration" => {
+                        if let Some((name, params, body)) = Self::parse_class_method_parts(&child, source) {
+                            overload_groups
+                                .entry(name)
+                                .or_default()
+                                .push((params, body));
+                        }
+                    }
+                    "property_declaration" | "variable_declaration" => {
+                        let field = Self::transpile_binding_declaration(&child, source);
+                        let field = field.trim_start_matches("let ");
+                        result.push_str("  static ");
+                        result.push_str(field);
+                    }
+                    "class_declaration" | "object_declaration" | "companion_object" => {}
+                    _ => {
+                        let out = Self::transpile_node(&child, source);
+                        if !out.trim().is_empty() {
+                            result.push_str("  ");
+                            result.push_str(&out);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (name, overloads) in overload_groups {
+            result.push_str("  static ");
             result.push_str(&Self::emit_class_method_with_overloads(&name, &overloads));
         }
 
@@ -497,37 +578,6 @@ impl KotlinTranspiler {
         out.push_str("    }\n");
         out.push_str("  }\n\n");
         out
-    }
-
-    fn transpile_class_method(node: &Node, source: &str) -> String {
-        let mut result = String::new();
-        let mut found_name = false;
-        let mut found_params = false;
-
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                match child.kind() {
-                    "identifier" if !found_name => {
-                        result.push_str(&Self::get_node_text(&child, source));
-                        found_name = true;
-                    }
-                    "function_value_parameters" if !found_params => {
-                        result.push_str(&Self::transpile_parameters(&child, source));
-                        found_params = true;
-                    }
-                    "function_body" => {
-                        result.push_str(&Self::transpile_function_body(&child, source));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if !result.trim().is_empty() {
-            result = format!("async {}", result);
-        }
-
-        format!("{}\n", result)
     }
 
     fn transpile_companion_object(node: &Node, source: &str) -> String {
@@ -771,13 +821,6 @@ impl KotlinTranspiler {
                 .chars()
                 .take_while(|ch| ch.is_whitespace())
                 .collect::<String>();
-
-            if trimmed.contains("<") && trimmed.contains(">") && trimmed.contains("filterIsInstance") {
-                result.push_str("  ");
-                result.push_str(&indent);
-                result.push_str("/* Kotlin generic call omitted in JS transpile */\n");
-                continue;
-            }
 
             if let Some((lhs, rhs)) = trimmed.split_once(" = ") {
                 let lhs = lhs.trim();
@@ -1233,17 +1276,16 @@ impl KotlinTranspiler {
         }
 
         if let Some(subject) = subject_expr {
-            let mut result = String::from("switch (");
+            let mut result = String::from("(() => { switch (");
             result.push_str(subject.trim());
             result.push_str(") {\n");
             for entry in entries {
                 result.push_str(&Self::transpile_when_entry(&entry, source));
             }
-            result.push_str("}\n");
+            result.push_str("} })()");
             return result;
         }
 
-        // Kotlin `when { ... }` (no subject) behaves like if/else-if expression.
         let mut result = String::from("(() => { ");
         let mut emitted_any_conditional = false;
         let mut default_body: Option<String> = None;
@@ -1346,23 +1388,47 @@ impl KotlinTranspiler {
     fn transpile_when_entry(node: &Node, source: &str) -> String {
         let mut result = String::new();
         let child_count = node.child_count();
+        let mut consequence_expr: Option<String> = None;
 
+        // First pass: collect all conditions and the consequence
         for i in 0..child_count {
             if let Some(child) = node.child(i as u32) {
                 match child.kind() {
                     "when_condition" => {
                         result.push_str("case ");
                         result.push_str(&Self::transpile_node(&child, source));
-                        result.push_str(":");
+                        result.push_str(":\n");
                     }
                     "->" => {}
                     "block" => {
-                        result.push_str(&Self::transpile_block(&child, source));
-                        result.push_str("break;");
+                        // Extract the body from the block
+                        let block_content = Self::transpile_block(&child, source);
+                        consequence_expr = Some(block_content);
                     }
-                    _ => {}
+                    _ => {
+                        // Try to capture simple expression consequences
+                        if consequence_expr.is_none() && 
+                           !child.kind().contains("comment") && 
+                           child.kind() != "LINE_SEPARATOR" &&
+                           child.kind() != "NL" {
+                            let expr = Self::transpile_node(&child, source).trim().to_string();
+                            if !expr.is_empty() && expr != "{" && expr != "}" && !expr.starts_with("/*") {
+                                consequence_expr = Some(expr);
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        // Add the consequence with return statement
+        if let Some(consequence) = consequence_expr {
+            result.push_str("return ");
+            result.push_str(consequence.trim());
+            if !consequence.trim().ends_with(";") {
+                result.push(';');
+            }
+            result.push('\n');
         }
 
         result
@@ -1675,6 +1741,9 @@ impl KotlinTranspiler {
     fn sanitize_output_js(text: &str) -> String {
         let text = text.replace("return throw ", "throw ");
         let text = Self::rewrite_kotlin_collection_calls(&text);
+        let text = Self::rewrite_kotlin_return_control_flow(&text);
+        let text = Self::rewrite_kotlin_for_ranges(&text);
+        let text = Self::rewrite_kotlin_catch_clauses(&text);
         let text = Self::rewrite_kotlin_trailing_lambdas(&text);
         let text = Self::rewrite_runtime_kotlinisms(&text);
         let text = Self::rewrite_extension_calls(&text);
@@ -1689,16 +1758,12 @@ impl KotlinTranspiler {
 
     fn rewrite_collection_helpers(text: &str) -> String {
         let filter_is_instance = Regex::new(
-            r"\.filterIsInstance<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>\(\)",
+            r"\.filterIsInstance<\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*>\(\)",
         )
         .expect("valid filterIsInstance regex");
         let out = filter_is_instance
             .replace_all(text, ".filter((x) => x instanceof $1)")
             .to_string();
-
-        let dangling_generic = Regex::new(r"\.([A-Za-z_][A-Za-z0-9_]*)>\(\)")
-            .expect("valid dangling generic regex");
-        let out = dangling_generic.replace_all(&out, "").to_string();
 
         let bare_map = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_\.]*)\.map\s*;")
             .expect("valid bare map regex");
@@ -1833,14 +1898,120 @@ impl KotlinTranspiler {
     }
 
     fn rewrite_kotlin_null_safety(text: &str) -> String {
+        let elvis_return = Regex::new(
+            r"\b([A-Za-z_][A-Za-z0-9_\.]*)\s*\?\?\s*\(return\s+([^;]+?)\)",
+        )
+        .expect("valid elvis return regex");
+        let text = elvis_return
+            .replace_all(text, "(() => { const __v = $1; if (__v == null) return $2; return __v; })()")
+            .to_string();
+
         let elvis_throw = Regex::new(
             r"\b([A-Za-z_][A-Za-z0-9_\.]*)\s*\?\?\s*\(\(\)\s*=>\s*\{\s*throw\s+([^;]+);\s*\}\)\(\)",
         )
         .expect("valid elvis throw regex");
 
         elvis_throw
-            .replace_all(text, "(() => { const __v = $1; if (__v == null) { throw $2; } return __v; })()")
+            .replace_all(&text, "(() => { const __v = $1; if (__v == null) { throw $2; } return __v; })()")
             .to_string()
+    }
+
+    fn rewrite_kotlin_for_ranges(text: &str) -> String {
+        let range_for = Regex::new(
+            r"for\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^\{]+?)\s+until\s+([^\{]+?)\s*\)\s*\{",
+        )
+        .expect("valid Kotlin range for regex");
+
+        range_for
+            .replace_all(text, "for (let $1 = $2; $1 < $3; $1++) {")
+            .to_string()
+    }
+
+    fn rewrite_kotlin_catch_clauses(text: &str) -> String {
+        let catch_clause = Regex::new(r"catch\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[A-Za-z_][A-Za-z0-9_\.<>?]*\s*\)")
+            .expect("valid Kotlin catch regex");
+        catch_clause.replace_all(text, "catch ($1)").to_string()
+    }
+
+    fn rewrite_kotlin_return_control_flow(text: &str) -> String {
+        let return_if = Regex::new(
+            r"return\s+if\s*\((?s:.*?)\)\s*\{\s*(?s:.*?)\s*\}\s*else\s*\{\s*(?s:.*?)\s*\}",
+        )
+        .expect("valid return-if regex");
+        let out = return_if
+            .replace_all(text, |caps: &regex::Captures<'_>| {
+                let full = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+                let if_start = full.find("if").unwrap_or(0);
+                let if_text = &full[if_start..];
+                let normalized = Self::normalize_if_expression_initializer(if_text)
+                    .trim()
+                    .to_string();
+                format!("return {};", normalized)
+            })
+            .to_string();
+
+        let return_try = Regex::new(
+            r"return\s+try\s*\{\s*(?s:(.*?))\s*\}\s*catch\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^)]*)?\)\s*\{\s*(?s:(.*?))\s*\}",
+        )
+        .expect("valid return-try regex");
+        return_try
+            .replace_all(&out, "return (() => { try { return $1; } catch ($2) { return $3; } })();")
+            .to_string()
+    }
+
+    fn rewrite_return_if_expression(expr: &str) -> Option<String> {
+        let trimmed = expr.trim_start();
+        if !trimmed.starts_with("if (") {
+            return None;
+        }
+
+        let rewritten = Self::normalize_if_expression_initializer(trimmed);
+        if rewritten == trimmed {
+            return None;
+        }
+
+        Some(format!("return {};", rewritten))
+    }
+
+    fn rewrite_return_try_expression(expr: &str) -> Option<(String, usize)> {
+        let trimmed = expr.trim_start();
+        if !trimmed.starts_with("try") {
+            return None;
+        }
+
+        let try_open = trimmed.find('{')?;
+        let try_close = Self::find_matching_brace_end(trimmed, try_open)?;
+        let try_body = trimmed[try_open + 1..try_close - 1].trim();
+
+        let after_try = trimmed[try_close..].trim_start();
+        if !after_try.starts_with("catch") {
+            return None;
+        }
+
+        let catch_paren_open = after_try.find('(')?;
+        let catch_paren_close = Self::find_matching_paren_end(after_try, catch_paren_open)?;
+        let catch_param = after_try[catch_paren_open + 1..catch_paren_close - 1].trim();
+
+        let after_catch_paren = after_try[catch_paren_close..].trim_start();
+        if !after_catch_paren.starts_with('{') {
+            return None;
+        }
+
+        let catch_open = after_catch_paren.find('{')?;
+        let catch_close = Self::find_matching_brace_end(after_catch_paren, catch_open)?;
+        let catch_body = after_catch_paren[catch_open + 1..catch_close - 1].trim();
+
+        let try_body = Self::rewrite_kotlin_return_control_flow(try_body);
+        let catch_body = Self::rewrite_kotlin_return_control_flow(catch_body);
+
+        let rewritten = format!(
+            "return (() => {{ try {{ return {}; }} catch ({}) {{ return {}; }} }})();",
+            try_body,
+            catch_param,
+            catch_body
+        );
+
+        Some((rewritten, catch_close + (after_try.len() - after_catch_paren.len())))
     }
 
     fn flatten_apply_iife_statement(text: &str) -> Option<String> {
@@ -1877,6 +2048,22 @@ impl KotlinTranspiler {
     }
 
     fn rewrite_kotlin_collection_calls(text: &str) -> String {
+        let int_array_lambda = Regex::new(
+            r"IntArray\(([^\)]+)\)\s*\{\s*([^{}]+?)\s*\}",
+        )
+        .expect("valid IntArray lambda regex");
+        let text = int_array_lambda
+            .replace_all(text, "Array.from({ length: $1 }, (_, it) => $2)")
+            .to_string();
+
+        let byte_array_lambda = Regex::new(
+            r"ByteArray\(([^\)]+)\)\s*\{\s*([^{}]+?)\s*\}",
+        )
+        .expect("valid ByteArray lambda regex");
+        let text = byte_array_lambda
+            .replace_all(&text, "Array.from({ length: $1 }, (_, it) => $2)")
+            .to_string();
+
         let mut out = String::new();
         let mut i = 0usize;
 
@@ -1888,7 +2075,7 @@ impl KotlinTranspiler {
 
             if rest.starts_with("listOf(") {
                 let open = i + "listOf".len();
-                if let Some(end) = Self::find_matching_paren_end(text, open) {
+                if let Some(end) = Self::find_matching_paren_end(&text, open) {
                     let inner = &text[open + 1..end - 1];
                     out.push('[');
                     out.push_str(inner);
@@ -1900,7 +2087,7 @@ impl KotlinTranspiler {
 
             if rest.starts_with("arrayOf(") {
                 let open = i + "arrayOf".len();
-                if let Some(end) = Self::find_matching_paren_end(text, open) {
+                if let Some(end) = Self::find_matching_paren_end(&text, open) {
                     let inner = &text[open + 1..end - 1];
                     out.push('[');
                     out.push_str(inner);
@@ -1923,7 +2110,7 @@ impl KotlinTranspiler {
 
             if rest.starts_with("ArrayList(") {
                 let open = i + "ArrayList".len();
-                if let Some(end) = Self::find_matching_paren_end(text, open) {
+                if let Some(end) = Self::find_matching_paren_end(&text, open) {
                     let inner = text[open + 1..end - 1].trim();
                     if inner.is_empty() {
                         out.push_str("[]");
@@ -1956,7 +2143,13 @@ impl KotlinTranspiler {
             .replace(".isEmpty()", ".length === 0")
             .replace(".mapIndexed(", ".map(")
             .replace("LinkedHashMap()", "new Map()")
-            .replace("throw Exception(", "throw new Error(");
+            .replace("throw Exception(", "throw new Error(")
+            .replace(" ushr ", " >>> ")
+            .replace(" shl ", " << ")
+            .replace(" shr ", " >> ")
+            .replace(" xor ", " ^ ")
+            .replace(" and ", " & ")
+            .replace(" or ", " | ");
 
         Self::rewrite_map_semantics(&text)
     }
@@ -2201,6 +2394,8 @@ impl KotlinTranspiler {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
+
     use super::*;
     use crate::{FULL_TEST_SOURCE_CODE, parse_kotlin_code};
     use oxc_allocator::Allocator;
@@ -2211,183 +2406,55 @@ mod tests {
     fn try_format_with_oxc(js_code: &str) -> Option<String> {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, js_code, SourceType::mjs()).parse();
+        
+        if !parsed.errors.is_empty() {
+            println!("Oxc parse errors:");
+            for error in parsed.errors.iter() {
+                println!("  {:?}", error);
 
-        if parsed.panicked || !parsed.errors.is_empty() {
+                let labels = error
+                    .deref()
+                    .labels
+                    .as_ref()
+                    .map(|labels| labels.as_slice())
+                    .unwrap_or(&[]);
+
+                for label in labels {
+                    let offset = label.offset();
+                    let length = label.len();
+                    let clamped_offset = offset.min(js_code.len());
+                    let line_start = js_code[..clamped_offset]
+                        .rfind('\n')
+                        .map(|idx| idx + 1)
+                        .unwrap_or(0);
+                    let line_end = js_code[clamped_offset..]
+                        .find('\n')
+                        .map(|idx| clamped_offset + idx)
+                        .unwrap_or(js_code.len());
+                    let line_number = js_code[..clamped_offset]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1;
+                    let column_number = js_code[line_start..clamped_offset].chars().count() + 1;
+                    let line_text = &js_code[line_start..line_end];
+                    let caret_width = length.max(1);
+
+                    println!("    --> line {}, column {}", line_number, column_number);
+                    println!("     |");
+                    println!("{:>4} | {}", line_number, line_text);
+                    println!("     | {:>width$}", "^".repeat(caret_width), width = column_number + caret_width - 1);
+                }
+            }
             return None;
-        }
+        } 
 
-        Some(Codegen::new().build(&parsed.program).code)
-    }
-
-    fn format_js_with_oxc(js_code: &str) -> (String, bool) {
-        if let Some(formatted) = try_format_with_oxc(js_code) {
-            return (formatted, true);
-        }
-
-        let allocator = Allocator::default();
-        let parsed = Parser::new(&allocator, js_code, SourceType::mjs()).parse();
         if parsed.panicked {
             println!("Oxc parser panicked while parsing full program.");
-        }
-        if !parsed.errors.is_empty() {
-            println!("Oxc parse errors (first 5):");
-            for error in parsed.errors.iter().take(5) {
-                println!("  {:?}", error);
-            }
-        }
+            return  None;  
+        } 
 
-        println!("Oxc full-program parse failed; applying best-effort function-level formatting.");
-        (format_functions_with_oxc(js_code), false)
-    }
-
-    fn format_functions_with_oxc(js_code: &str) -> String {
-        let mut output = String::new();
-        let mut cursor = 0usize;
-
-        while let Some(rel_start) = js_code[cursor..].find("function ") {
-            let start = cursor + rel_start;
-            output.push_str(&js_code[cursor..start]);
-
-            let remaining = &js_code[start..];
-            if let Some(fn_len) = extract_function_len(remaining) {
-                let function_text = &remaining[..fn_len];
-                if let Some(formatted_fn) = try_format_with_oxc(function_text) {
-                    output.push_str(formatted_fn.trim_end());
-                } else {
-                    output.push_str(function_text);
-                }
-                cursor = start + fn_len;
-            } else {
-                output.push_str(remaining);
-                cursor = js_code.len();
-            }
-        }
-
-        if cursor < js_code.len() {
-            output.push_str(&js_code[cursor..]);
-        }
-
-        output
-    }
-
-    fn extract_function_len(source: &str) -> Option<usize> {
-        let bytes = source.as_bytes();
-        let open_brace = bytes.iter().position(|b| *b == b'{')?;
-
-        let mut depth = 0usize;
-        let mut i = open_brace;
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut in_template = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-        let mut escaped = false;
-
-        while i < bytes.len() {
-            let b = bytes[i];
-            let next = bytes.get(i + 1).copied();
-
-            if in_line_comment {
-                if b == b'\n' {
-                    in_line_comment = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_block_comment {
-                if b == b'*' && next == Some(b'/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_single {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'\'' {
-                    in_single = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_double {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'"' {
-                    in_double = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_template {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'`' {
-                    in_template = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if b == b'/' && next == Some(b'/') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if b == b'/' && next == Some(b'*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if b == b'\'' {
-                in_single = true;
-                i += 1;
-                continue;
-            }
-
-            if b == b'"' {
-                in_double = true;
-                i += 1;
-                continue;
-            }
-
-            if b == b'`' {
-                in_template = true;
-                i += 1;
-                continue;
-            }
-
-            if b == b'{' {
-                depth += 1;
-            } else if b == b'}' {
-                if depth == 0 {
-                    return None;
-                }
-
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-
-            i += 1;
-        }
-
-        None
+        Some(Codegen::new().build(&parsed.program).code)
     }
 
     #[test]
@@ -2401,13 +2468,12 @@ fun main() {
         println!("AST:\n{}", tree.root_node().to_sexp());
         
         let js_code = KotlinTranspiler::transpile(kotlin_code, &tree);
-        let formatted_js = format_js_with_oxc(&js_code);
+        let formatted_js = try_format_with_oxc(&js_code).unwrap();
         
-        println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js.0);
+        // println!("Transpiled JS:\n{}", js_code);
+        println!("Formatted JS:\n{}", formatted_js);
         
         assert!(!js_code.is_empty());
-        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
     }
 
     #[test]
@@ -2420,11 +2486,10 @@ fun test() {
 "#;
         let tree = parse_kotlin_code(kotlin_code);
         let js_code = KotlinTranspiler::transpile(kotlin_code, &tree);
-        let formatted_js = format_js_with_oxc(&js_code);
+        let formatted_js = try_format_with_oxc(&js_code).unwrap();
 
         println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js.0);
-        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
+        println!("Formatted JS:\n{}", formatted_js);
 
         assert!(js_code.contains("let"));
     }
@@ -2438,13 +2503,12 @@ fun test() {
 "#;
         let tree = parse_kotlin_code(kotlin_code);
         let js_code = KotlinTranspiler::transpile(kotlin_code, &tree);
-        let formatted_js = format_js_with_oxc(&js_code);
+        let formatted_js = try_format_with_oxc(&js_code).unwrap();
 
-        println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js.0);
+        // println!("Transpiled JS:\n{}", js_code);
+        println!("Formatted JS:\n{}", formatted_js);
 
         assert!(js_code.contains("let"));
-        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
     }
 
     #[test]
@@ -2461,15 +2525,14 @@ fun setupPreferenceScreen(screen: PreferenceScreen) {
         let tree = parse_kotlin_code(kotlin_code);
         println!("AST:\n{}", tree.root_node().to_sexp());
         let js_code = KotlinTranspiler::transpile(kotlin_code, &tree);
-        let formatted_js = format_js_with_oxc(&js_code);
+        let formatted_js = try_format_with_oxc(&js_code).unwrap();
 
-        println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js.0);
+        // println!("Transpiled JS:\n{}", js_code);
+        println!("Formatted JS:\n{}", formatted_js);
 
         assert!(!js_code.contains(".apply {"));
         assert!(!js_code.contains(".let("));
-        assert!(formatted_js.0.contains("screen.addPreference") || formatted_js.0.contains("addPreference"));
-        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
+        assert!(formatted_js.contains("screen.addPreference") || formatted_js.contains("addPreference"));
     }
 
     #[test]
@@ -2480,12 +2543,11 @@ import kotlin.collections.Map
 "#;
         let tree = parse_kotlin_code(kotlin_code);
         let js_code = KotlinTranspiler::transpile(kotlin_code, &tree);
-        let formatted_js = format_js_with_oxc(&js_code);
+        let formatted_js = try_format_with_oxc(&js_code).unwrap();
 
-        println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js.0);
+        // println!("Transpiled JS:\n{}", js_code);
+        println!("Formatted JS:\n{}", formatted_js);
         assert!(js_code.contains("import { List } from \"java.util\";"));
-        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
     }
 
     #[test]
@@ -2493,11 +2555,46 @@ import kotlin.collections.Map
         let kotlin_code = FULL_TEST_SOURCE_CODE;
         let tree = parse_kotlin_code(kotlin_code);
         let js_code = KotlinTranspiler::transpile(kotlin_code, &tree);
-        let formatted_js = format_js_with_oxc(&js_code);
+        let formatted_js = try_format_with_oxc(&js_code).unwrap();
 
-        println!("Transpiled JS:\n{}", js_code);
-        println!("Formatted JS:\n{}", formatted_js.0);
-        assert!(formatted_js.1); // if this fails it means, oxc couldn't parse it meaning there are still kotlin code or syntax errors
+        // println!("Transpiled JS:\n{}", js_code);
+        println!("Formatted JS:\n{}", formatted_js);
         assert!(!js_code.is_empty());
+    }
+
+    #[test]
+    fn full_files_test() {
+        // get files in temp/files with .kt extension
+        // get current pwd
+        let current_dir = std::env::current_dir().expect("Failed to get current directory");
+        let full_abs_path = current_dir.join("./temp/files");
+        let kotline_files = std::fs::read_dir(&full_abs_path)
+            .expect(format!("Failed to read {}, at {}", full_abs_path.display(), full_abs_path.display()).as_str())
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension()?.to_str()? == "kt" {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut errored_count = 0;
+        for file_path in &kotline_files {
+            println!("Testing file: {}", file_path.display());
+            let kotlin_code = std::fs::read_to_string(&file_path)
+                .unwrap_or_else(|_| panic!("Failed to read file {}", file_path.display()));
+            let tree = parse_kotlin_code(&kotlin_code);
+            let js_code = KotlinTranspiler::transpile(&kotlin_code, &tree);
+
+            if try_format_with_oxc(&js_code).is_none() {
+                println!("Oxc failed to parse the generated JS for file {}", file_path.display());
+                println!("Transpiled JS for file {}:\n{}", file_path.display(), js_code);
+                errored_count += 1;
+            }
+        }
+        println!("Total errors found: {}/{}", errored_count, kotline_files.len());  
     }
 }
