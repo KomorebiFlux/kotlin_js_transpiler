@@ -69,4 +69,15 @@ mod tests {
         assert!(js_code.contains("class") || js_code.contains("function"));
         assert!(!js_code.contains("Oxc full-program parse failed; applying best-effort function-level formatting."));
     }
+
+    #[test]
+    fn test_apply_with_lambda() {
+        let code = r#"fun test() {
+    val url = builder.apply {
+        addQueryParameter("key", "val")
+    }.build()
+}"#;
+        let js_code = transpile_kotlin_to_js(code);
+        println!("Transpiled JS:\n{}", js_code);
+    }
 }
